@@ -1,0 +1,30 @@
+# Dev local : docker compose up --build
+services:
+  api:
+    build: .
+    ports:
+      - "4000:4000"
+    environment:
+      NODE_ENV: development
+      PORT: 4000
+      DATABASE_URL: postgres://postgres:postgres@db:5432/sahhaonline?sslmode=disable
+      CORS_ORIGINS: http://localhost:3000
+      ORDER_WEBHOOK_URL: ${ORDER_WEBHOOK_URL:-}
+      IP_HASH_SALT: ${IP_HASH_SALT:-dev-salt}
+    depends_on:
+      db:
+        condition: service_healthy
+
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: sahhaonline
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d sahhaonline"]
+      interval: 3s
+      timeout: 5s
+      retries: 10
