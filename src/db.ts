@@ -4,6 +4,9 @@ const { Pool } = pg;
 
 export const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
+  connectionTimeoutMillis: 5_000,
+  idleTimeoutMillis: 30_000,
+  max: 10,
 });
 
 export async function query<T extends pg.QueryResultRow = pg.QueryResultRow>(

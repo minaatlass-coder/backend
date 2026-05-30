@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import type { Request, Response, Router } from "express";
 import { Router as createRouter } from "express";
 import { products, type ProductSlug } from "../data/products.js";
-import { generateOrderId, isValidSlug } from "../lib/order.js";
+import { generateOrderId, isValidOrderId, isValidSlug } from "../lib/order.js";
 import { normalizePhone, validateAddress, validateName } from "../lib/phone.js";
 import { getOrderSnapshot, saveOrderEvent } from "../lib/persist.js";
 import { sendCapiEvent, type MarketingContext } from "../lib/marketing.js";
@@ -56,14 +56,19 @@ function hashIp(ip: string): string {
     .slice(0, 16);
 }
 
-const WEBHOOK_TIMEOUT_MS = 20_000;
+const WEBHOOK_TIMEOUT_MS = 8_000;
+
+/** Side effects must not delay the HTTP response (checkout UX). */
+function afterResponse(fn: () => void): void {
+  setImmediate(fn);
+}
 
 async function forwardToWebhook(payload: unknown): Promise<void> {
   const url = process.env.ORDER_WEBHOOK_URL;
   if (!url) {
-    if (process.env.NODE_ENV !== "production") {
-      console.log("[order webhook — DEV mock]", JSON.stringify(payload, null, 2));
-    }
+    const msg = "[order webhook] ORDER_WEBHOOK_URL is not configured";
+    if (process.env.NODE_ENV === "production") console.error(msg);
+    else console.log("[order webhook — DEV mock]", JSON.stringify(payload, null, 2));
     return;
   }
   const controller = new AbortController();
@@ -75,9 +80,18 @@ async function forwardToWebhook(payload: unknown): Promise<void> {
       body: JSON.stringify(payload),
       signal: controller.signal,
     });
+    const text = await res.text().catch(() => "");
     if (!res.ok) {
-      const text = await res.text().catch(() => "");
       console.error("[order webhook] HTTP", res.status, text.slice(0, 500));
+      return;
+    }
+    try {
+      const data = JSON.parse(text) as { ok?: boolean; error?: unknown };
+      if (data.ok === false) {
+        console.error("[order webhook] rejected", String(data.error ?? "unknown"));
+      }
+    } catch {
+      // Some webhook providers return non-JSON success bodies; HTTP 2xx is enough.
     }
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
@@ -167,7 +181,9 @@ export function orderRouter(): Router {
       }
 
       const subtotal = validItems.reduce((s, i) => s + i.line_total, 0);
-      const order_id = generateOrderId();
+      const order_id = isValidOrderId(body.order_id)
+        ? body.order_id
+        : generateOrderId();
       const event_id = body.event_id || `${order_id}-purchase`;
 
       const payload = {
@@ -192,30 +208,6 @@ export function orderRouter(): Router {
         ip_hash: hashIp(ip),
       };
 
-      scheduleWebhook(payload);
-      schedulePersist("order_created", order_id, payload);
-      void sendCapiEvent({
-        eventName: "Purchase",
-        eventId: event_id,
-        eventTime: Math.floor(Date.now() / 1000),
-        sourceUrl: payload.source_url,
-        userAgent: String(req.headers["user-agent"] ?? ""),
-        ip,
-        name: nameRes.name,
-        phoneNormalized: phoneRes.phone,
-        address: addressRes.address,
-        value: subtotal,
-        currency: "MAD",
-        contents: validItems.map((i) => ({
-          id: i.sku,
-          quantity: i.qty,
-          item_price: i.unit_price,
-        })),
-        context: body.context,
-      }).catch((e) => {
-        console.error("[order capi] purchase failed", e);
-      });
-
       res.json({
         ok: true,
         order_id,
@@ -227,6 +219,32 @@ export function orderRouter(): Router {
         phone: phoneRes.phone,
         created_at: payload.created_at,
       });
+
+      afterResponse(() => {
+        scheduleWebhook(payload);
+        schedulePersist("order_created", order_id, payload);
+        void sendCapiEvent({
+          eventName: "Purchase",
+          eventId: event_id,
+          eventTime: Math.floor(Date.now() / 1000),
+          sourceUrl: payload.source_url,
+          userAgent: String(req.headers["user-agent"] ?? ""),
+          ip,
+          name: nameRes.name,
+          phoneNormalized: phoneRes.phone,
+          address: addressRes.address,
+          value: subtotal,
+          currency: "MAD",
+          contents: validItems.map((i) => ({
+            id: i.sku,
+            quantity: i.qty,
+            item_price: i.unit_price,
+          })),
+          context: body.context,
+        }).catch((e) => {
+          console.error("[order capi] purchase failed", e);
+        });
+      });
       return;
     }
 
@@ -235,13 +253,14 @@ export function orderRouter(): Router {
         res.status(400).json({ ok: false, error: "Requête invalide." });
         return;
       }
+      const orderId = body.order_id;
       const slug = body.upsell_slug as ProductSlug;
       const p = products[slug];
 
       const payload = {
         event: "upsell_added" as const,
-        event_id: body.event_id ?? `${body.order_id}-upsell-${slug}`,
-        order_id: body.order_id,
+        event_id: body.event_id ?? `${orderId}-upsell-${slug}`,
+        order_id: orderId,
         upsell: {
           sku: slug,
           name_fr: p.nameFr,
@@ -251,31 +270,37 @@ export function orderRouter(): Router {
         currency: "MAD" as const,
       };
 
-      scheduleWebhook(payload);
-      schedulePersist("upsell_added", body.order_id, payload);
-      const snapshot = await getOrderSnapshot(body.order_id).catch(() => null);
-      void sendCapiEvent({
-        eventName: "UpsellAccepted",
-        eventId: payload.event_id,
-        eventTime: Math.floor(Date.now() / 1000),
-        sourceUrl: body.source_url ?? String(req.headers.referer ?? ""),
-        userAgent: String(req.headers["user-agent"] ?? ""),
-        ip,
-        name: snapshot?.name,
-        phoneNormalized: snapshot?.phone_normalized,
-        address: snapshot?.address,
-        value: p.upsellPrice,
-        currency: "MAD",
-        contents: [{ id: slug, quantity: 1, item_price: p.upsellPrice }],
-        context: body.context,
-      }).catch((e) => {
-        console.error("[order capi] upsell failed", e);
-      });
-
       res.json({
         ok: true,
-        order_id: body.order_id,
+        order_id: orderId,
         upsell: payload.upsell,
+      });
+
+      afterResponse(() => {
+        scheduleWebhook(payload);
+        schedulePersist("upsell_added", orderId, payload);
+        void getOrderSnapshot(orderId)
+          .catch(() => null)
+          .then((snapshot) =>
+            sendCapiEvent({
+              eventName: "UpsellAccepted",
+              eventId: payload.event_id,
+              eventTime: Math.floor(Date.now() / 1000),
+              sourceUrl: body.source_url ?? String(req.headers.referer ?? ""),
+              userAgent: String(req.headers["user-agent"] ?? ""),
+              ip,
+              name: snapshot?.name,
+              phoneNormalized: snapshot?.phone_normalized,
+              address: snapshot?.address,
+              value: p.upsellPrice,
+              currency: "MAD",
+              contents: [{ id: slug, quantity: 1, item_price: p.upsellPrice }],
+              context: body.context,
+            }),
+          )
+          .catch((e) => {
+            console.error("[order capi] upsell failed", e);
+          });
       });
       return;
     }
@@ -317,23 +342,25 @@ export function orderRouter(): Router {
         ip_hash: hashIp(ip),
       };
 
-      scheduleWebhook(payload);
-      schedulePersist("contact_message", null, payload);
-      void sendCapiEvent({
-        eventName: "Lead",
-        eventId: payload.event_id,
-        eventTime: Math.floor(Date.now() / 1000),
-        sourceUrl: payload.source_url,
-        userAgent: String(req.headers["user-agent"] ?? ""),
-        ip,
-        name: nameRes.name,
-        phoneNormalized: phoneRes.phone,
-        context: body.context,
-      }).catch((e) => {
-        console.error("[order capi] contact failed", e);
-      });
-
       res.json({ ok: true });
+
+      afterResponse(() => {
+        scheduleWebhook(payload);
+        schedulePersist("contact_message", null, payload);
+        void sendCapiEvent({
+          eventName: "Lead",
+          eventId: payload.event_id,
+          eventTime: Math.floor(Date.now() / 1000),
+          sourceUrl: payload.source_url,
+          userAgent: String(req.headers["user-agent"] ?? ""),
+          ip,
+          name: nameRes.name,
+          phoneNormalized: phoneRes.phone,
+          context: body.context,
+        }).catch((e) => {
+          console.error("[order capi] contact failed", e);
+        });
+      });
       return;
     }
 

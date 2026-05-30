@@ -9,6 +9,10 @@ export function generateOrderId(date = new Date()): string {
   return `SAH-${ymd}-${rand}`;
 }
 
+export function isValidOrderId(s: unknown): s is string {
+  return typeof s === "string" && /^SAH-\d{8}-[0-9A-F]{4}$/.test(s);
+}
+
 export function isValidSlug(s: unknown): s is ProductSlug {
   return typeof s === "string" && (SLUGS as readonly string[]).includes(s);
 }
