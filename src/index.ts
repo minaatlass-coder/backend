@@ -2,6 +2,7 @@ import cors from "cors";
 import express from "express";
 import { pool } from "./db.js";
 import { runMigrations } from "./migrate.js";
+import { adminRouter } from "./routes/admin.js";
 import { orderRouter } from "./routes/order.js";
 import { trackRouter } from "./routes/track.js";
 
@@ -25,6 +26,7 @@ async function main(): Promise<void> {
     cors({
       origin: parseCorsOrigins(),
       methods: ["GET", "POST", "OPTIONS"],
+      allowedHeaders: ["Content-Type", "Authorization"],
     }),
   );
 
@@ -39,6 +41,7 @@ async function main(): Promise<void> {
 
   app.use("/api/order", orderRouter());
   app.use("/api/track", trackRouter());
+  app.use("/api/admin", adminRouter());
 
   const port = Number(process.env.PORT ?? 4000);
   app.listen(port, "0.0.0.0", () => {

@@ -1,28 +1,27 @@
 import type { Request, Response, Router } from "express";
 import { Router as createRouter } from "express";
-import { saveOrderEvent } from "../lib/persist.js";
+import { resolveIpGeo } from "../lib/ip-geo.js";
 import { sendCapiEvent, type MarketingContext } from "../lib/marketing.js";
+import { saveOrderEvent } from "../lib/persist.js";
+import { getClientIp, hashIp, pagePathFromUrl } from "../lib/request-ip.js";
+import { saveSiteEvent } from "../lib/site-events.js";
 
 interface TrackBody {
   event?: string;
   event_id?: string;
   event_time?: number;
+  ts?: number;
   value?: number;
   currency?: string;
   source_url?: string;
+  slug?: string;
+  product_slug?: string;
+  page_path?: string;
   name?: string;
   phone?: string;
   address?: string;
   contents?: Array<{ id: string; quantity: number; item_price: number }>;
   context?: MarketingContext;
-}
-
-function getIp(req: Request): string {
-  const fwd = req.headers["x-forwarded-for"];
-  if (typeof fwd === "string" && fwd) return fwd.split(",")[0].trim();
-  const real = req.headers["x-real-ip"];
-  if (typeof real === "string" && real) return real;
-  return req.socket.remoteAddress ?? "unknown";
 }
 
 function mapEventName(event: string): string {
@@ -52,15 +51,43 @@ export function trackRouter(): Router {
       return;
     }
 
+    const ip = getClientIp(req);
+    const geo = await resolveIpGeo(ip);
+    const ipHash = hashIp(ip);
+    const sourceUrl = body.source_url ?? "";
+    const productSlug = (body.slug ?? body.product_slug ?? "").trim() || undefined;
+    const pagePath =
+      (body.page_path ?? "").trim() || pagePathFromUrl(sourceUrl) || undefined;
+
     const payload = {
       event,
       event_id: eventId,
-      event_time: body.event_time ?? Math.floor(Date.now() / 1000),
+      event_time: body.event_time ?? Math.floor((body.ts ?? Date.now()) / 1000),
       value: body.value,
       currency: body.currency ?? "MAD",
-      source_url: body.source_url ?? "",
+      source_url: sourceUrl,
       context: body.context ?? {},
+      traffic_valid_ma: geo.isValidMa,
+      ip_country: geo.countryCode,
     };
+
+    res.json({ ok: true });
+
+    void saveSiteEvent({
+      eventName: event,
+      eventId,
+      pagePath,
+      productSlug,
+      value: body.value,
+      currency: body.currency,
+      ipHash,
+      geo,
+      sourceUrl,
+      userAgent: String(req.headers["user-agent"] ?? ""),
+      payload: body as Record<string, unknown>,
+    }).catch((e) => {
+      console.error("[track site_events] failed", e);
+    });
 
     void saveOrderEvent("marketing_event", null, payload).catch((e) => {
       console.error("[track persist] failed", e);
@@ -72,7 +99,7 @@ export function trackRouter(): Router {
       eventTime: payload.event_time,
       sourceUrl: body.source_url,
       userAgent: String(req.headers["user-agent"] ?? ""),
-      ip: getIp(req),
+      ip,
       name: body.name,
       phoneNormalized: body.phone,
       address: body.address,
@@ -83,10 +110,7 @@ export function trackRouter(): Router {
     }).catch((e) => {
       console.error("[track capi] failed", e);
     });
-
-    res.json({ ok: true });
   });
 
   return router;
 }
-

@@ -1,11 +1,12 @@
-import { createHash } from "node:crypto";
 import type { Request, Response, Router } from "express";
 import { Router as createRouter } from "express";
 import { products, type ProductSlug } from "../data/products.js";
+import { resolveIpGeo } from "../lib/ip-geo.js";
 import { generateOrderId, isValidOrderId, isValidSlug } from "../lib/order.js";
 import { normalizePhone, validateAddress, validateName } from "../lib/phone.js";
 import { getOrderSnapshot, saveOrderEvent } from "../lib/persist.js";
 import { sendCapiEvent, type MarketingContext } from "../lib/marketing.js";
+import { getClientIp, hashIp } from "../lib/request-ip.js";
 
 interface CartLineInput {
   slug: string;
@@ -32,14 +33,6 @@ const RATE_WINDOW_MS = 60_000;
 const RATE_MAX = 6;
 const ipHits = new Map<string, number[]>();
 
-function getIp(req: Request): string {
-  const fwd = req.headers["x-forwarded-for"];
-  if (typeof fwd === "string" && fwd) return fwd.split(",")[0].trim();
-  const real = req.headers["x-real-ip"];
-  if (typeof real === "string" && real) return real;
-  return req.socket.remoteAddress ?? "unknown";
-}
-
 function rateLimited(ip: string): boolean {
   const now = Date.now();
   const list = ipHits.get(ip) ?? [];
@@ -47,13 +40,6 @@ function rateLimited(ip: string): boolean {
   recent.push(now);
   ipHits.set(ip, recent);
   return recent.length > RATE_MAX;
-}
-
-function hashIp(ip: string): string {
-  return createHash("sha256")
-    .update(ip + (process.env.IP_HASH_SALT ?? "sahha"))
-    .digest("hex")
-    .slice(0, 16);
 }
 
 const WEBHOOK_TIMEOUT_MS = 8_000;
@@ -128,7 +114,7 @@ export function orderRouter(): Router {
       return;
     }
 
-    const ip = getIp(req);
+    const ip = getClientIp(req);
     if (rateLimited(ip)) {
       res.status(429).json({
         ok: false,
@@ -221,8 +207,18 @@ export function orderRouter(): Router {
       });
 
       afterResponse(() => {
-        scheduleWebhook(payload);
-        schedulePersist("order_created", order_id, payload);
+        void resolveIpGeo(ip)
+          .then((geo) => ({
+            ...payload,
+            traffic_valid_ma: geo.isValidMa,
+            ip_country: geo.countryCode,
+            ip_proxy: geo.isProxy,
+            ip_hosting: geo.isHosting,
+          }))
+          .then((enriched) => {
+            scheduleWebhook(enriched);
+            schedulePersist("order_created", order_id, enriched);
+          });
         void sendCapiEvent({
           eventName: "Purchase",
           eventId: event_id,
@@ -345,8 +341,18 @@ export function orderRouter(): Router {
       res.json({ ok: true });
 
       afterResponse(() => {
-        scheduleWebhook(payload);
-        schedulePersist("contact_message", null, payload);
+        void resolveIpGeo(ip)
+          .then((geo) => ({
+            ...payload,
+            traffic_valid_ma: geo.isValidMa,
+            ip_country: geo.countryCode,
+            ip_proxy: geo.isProxy,
+            ip_hosting: geo.isHosting,
+          }))
+          .then((enriched) => {
+            scheduleWebhook(enriched);
+            schedulePersist("contact_message", null, enriched);
+          });
         void sendCapiEvent({
           eventName: "Lead",
           eventId: payload.event_id,
